@@ -25,6 +25,7 @@ LOG_FILE = "pvMail-%d.log" % os.getpid()
 RETRY_INTERVAL_S = 0.2
 CHECKPOINT_INTERVAL_S = 5 * 60.0
 CONNECTION_TEST_TIMEOUT = 0.5
+GRACE_PERIOD_S = 1.0
 
 gui_object = None
 
@@ -37,6 +38,7 @@ class PvMail(threading.Thread):     # lgtm [py/missing-call-to-init]
     
     def __init__(self, config=None):
         self.trigger = False
+        self.trigger_high = False
         self.message = "default message"
         self.subject = "pvMail.py"
         self.triggerPV = ""
@@ -149,12 +151,19 @@ class PvMail(threading.Thread):     # lgtm [py/missing-call-to-init]
             
             # send the message in a different thread
             #SendMessage(self, self.config)
-            t = threading.Thread(target=SendMessage, args=(self, self.config))
-            t.start()
+            #t = threading.Thread(target=SendMessage, args=(self, self.config))
+            #t.start()
+            
+        elif (self.old_value == 0 and value == 2) or (self.old_value == 1 and value == 2):
+            self.trigger_high = True
+            pv = self.pv['trigger']
+            self.ca_timestamp = pv.timestamp
+            self.ca_timestamp = pv.timestamp
+            
         self.old_value = value
 
 
-def SendMessage(pvm, agent_db, reporter=None):
+def SendMessage(pvm, agent_db, reporter=None, high_severity=False):
     '''
     construct and send the message
     
@@ -170,7 +179,7 @@ def SendMessage(pvm, agent_db, reporter=None):
     emailer = email_agent_dict[agent_db.mail_transfer_agent]
 
     try:
-        _send(emailer, pvm, agent_db, logger=logger)
+        _send(emailer, pvm, agent_db, logger=logger, high_severity=high_severity)
     except Exception, exc:
         msg = 'problem sending email: ' + str(exc)
         logger(msg)
@@ -183,13 +192,15 @@ def getUserName(db):
     return u1 or u2 or u3
 
 
-def _send(emailer, pvm, agent_db, reporter=None, logger=None):
+def _send(emailer, pvm, agent_db, reporter=None, logger=None, high_severity=False):
     pvm.basicChecks()
     
     pvm.subject = "pvMail.py: " + pvm.triggerPV
     
     msg = ''        # start with a new message
     msg += "\n\n"
+    msg += 'Monitored PV: %s\n' % pvm.triggerPV
+    msg += 'Alarm Status: %s\n' % ("MINOR" if not high_severity else "MAJOR")
     msg += epics.caget(pvm.messagePV)
     msg += "\n\n"
     username = getUserName(agent_db)
@@ -202,7 +213,6 @@ def _send(emailer, pvm, agent_db, reporter=None, logger=None):
         msg += 'CA_timestamp: not available\n'
     msg += 'program: %s\n' % sys.argv[0]
     msg += 'PID: %d\n' % os.getpid()
-    msg += 'trigger PV: %s\n' % pvm.triggerPV
     msg += 'message PV: %s\n' % pvm.messagePV
     msg += 'recipients: %s\n' % ", ".join(pvm.recipients)
     pvm.message = msg
@@ -238,6 +248,7 @@ def cli(results, config=None):
     '''
     logging_interval = min(60*60, max(5.0, results.logging_interval))
     sleep_duration = min(5.0, max(0.0001, results.sleep_duration))
+    grace_period = results.grace_period
 
     pvm = PvMail(config)
     pvm.triggerPV = results.trigger_PV
@@ -245,13 +256,24 @@ def cli(results, config=None):
     pvm.recipients = results.email_addresses.strip().split(",")
     checkpoint_time = time.time()
     pvm.do_start()
+    last_email_time=0
     while True:     # endless loop, kill with ^C or equal
         if time.time() > checkpoint_time:
             checkpoint_time += logging_interval
             logger("checkpoint")
         if pvm.trigger:
-            SendMessage(pvm, config)
-            logger('trigger received, sending email')
+            if (time.time() > last_email_time + grace_period*60):           
+                SendMessage(pvm, config)
+                logger('trigger received, sending email')
+                pvm.trigger = False
+                last_email_time = time.time()
+            else:
+                logger('trigger received, but email skipped because within minimum time between Emails.')
+                pvm.trigger = False
+        if pvm.trigger_high: # overrides grace period
+            SendMessage(pvm, config, high_severity=True)
+            logger('high severity trigger received, sending email')
+            pvm.trigger_high = False
         time.sleep(sleep_duration)
     # pvm.do_stop()        # this will never be called
 
@@ -308,6 +330,11 @@ def main():
                         type=float,
                         help="sleep duration (s) in main event loop", 
                         default=RETRY_INTERVAL_S)
+                        
+    parser.add_argument('-s', action='store', dest='grace_period', 
+                        type=float,
+                        help="Minimum time between emails (s)", 
+                        default=GRACE_PERIOD_S)
 
     parser.add_argument('-g', '--gui', action='store_true', default=False,
                         dest='interface',
@@ -331,6 +358,7 @@ def main():
     logger("log file         = " + results.log_file)
     logger("logging interval = " + str( results.logging_interval ) )
     logger("sleep duration   = " + str( results.sleep_duration ) )
+    logger("grace period     = " + str( results.grace_period ) )
     logger("interface        = " + interface)
     user = os.environ.get('LOGNAME', None) or os.environ.get('USERNAME', None)
     logger("user             = " + user)
