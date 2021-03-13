@@ -360,7 +360,7 @@ def main():
     logger("sleep duration   = " + str( results.sleep_duration ) )
     logger("grace period     = " + str( results.grace_period ) )
     logger("interface        = " + interface)
-    user = os.environ.get('LOGNAME', None) or os.environ.get('USERNAME', None)
+    user = getUserName(agent_db)
     logger("user             = " + user)
     logger("host             = " + socket.gethostname() )
     logger("program          = " + sys.argv[0] )
